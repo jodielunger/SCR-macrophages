@@ -4,7 +4,7 @@ This repository contains scripts to run two-state modeling associated with the S
 
 Requirements: 
 1. `phago_suma_combined.Rds`: This is the only dataset required to run the two-state model and must be downloaded from [Zenodo](10.5281/zenodo.19699424). During peer review, this dataset will be restricted for reviewer access only.
-2. `run_two-state_model.Rmd`: This is the only script required to run the two-state model. This script is best run in Rstudio or another UI optimized for running R markdown files.
+2. `run_two-state_model_v3.Rmd`: This is the only script required to run the two-state model. This script is best run in Rstudio or another UI optimized for running R markdown files.
 
 ---
 
@@ -202,4 +202,4 @@ Note that Eq. 11 is equivalent to Eq. 6 — the product-of-$K_s$ form is simply 
 
 ## Software
 
-All analysis was performed in R (v.4.3.2). Nonlinear optimization used `optim()` from base R. Cross-validation splits were generated with the `rsample` package. Data manipulation used `dplyr`, `tidyr`, `purrr`, and `stringr`. Plots were produced with `ggplot2`, `ggrepel`, and `ggh4x`. See **Code Availability** for the full analysis script.
+All analysis was performed in R (v.4.3.2). Nonlinear optimization used `optim()` from base R. Cross-validation splits were generated with the `rsample` package. Data manipulation used `dplyr`, `tidyr`, `purrr`, and `stringr`. Plots were produced with `ggplot2`, `ggrepel`, and `ggh4x`. See `run_two-state_model_v3.Rmd` for the full analysis script.
