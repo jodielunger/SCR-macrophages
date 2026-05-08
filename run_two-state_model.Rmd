@@ -4,6 +4,7 @@ output: html_document
 date: "2026-04-26"
 ---
 
+
 This R markdown file contains code to run two-state modeling on the combinatorial SCR library tested in the first SCR Macrophage manuscript. 
 I recommend running this as code chunks in Rstudio. 
 
@@ -17,6 +18,11 @@ plot_folder <- "/Users/jodielunger/OneDrive - Stanford/Code/combo_lib_modeling/"
 ```
 
 
+# ===================================
+# Steps for running two-state model
+# ===================================
+
+
 # Step 1 - Load Required Packages
 ```{r}
 library(dplyr)
@@ -24,11 +30,9 @@ library(ggplot2)
 library(tidyr)
 library(purrr)
 library(stringr)
-library(broom)
 library(forcats)
 library(tibble)
 library(rsample)
-library(ggrepel)
 library(ggh4x)
 ```
 
@@ -155,10 +159,6 @@ phenotype_mean_cols <- synth_df_aggregated %>%
   colnames()
 
 
-# Create dataframe for phenotype data
-phenotype_data <- synth_df_aggregated %>%
-  select(sample_name, S1:S9, ends_with("_mean"))
-
 # Helper: estimate two-state expression bounds for one phenotype column
 # f_low  = lowest observed value 
 # f_high = highest observed value
@@ -257,7 +257,7 @@ estimate_two_state_extremes <- function(df, pheno_col, k = 1, make_plot = TRUE) 
 phenotype_extremes_list <- purrr::map(
   phenotype_mean_cols,
   ~ estimate_two_state_extremes(
-    df = phenotype_data,
+    df = synth_df_aggregated,
     pheno_col = .x,
     k = 1,
     make_plot = TRUE
@@ -327,223 +327,147 @@ where $\Delta E_{i}$ is the intrinsic $\Delta E$ value when there are no motifs 
 
 
 
-Create a base dataset for model fitting
 ```{r}
-# Assign motif_cols to be S1:S9
-motif_cols    <- paste0("S", 1:9)
+motif_cols <- paste0("S", 1:9)
 
-# Base dataframe used for fitting: motifs + all mean phenotypes
-base_fit_df <- synth_df_aggregated %>%
-  select(sample_name, all_of(motif_cols), all_of(phenotype_mean_cols)) %>%
+# Individual replicates used for model fitting
+fit_df <- synth_df %>%
+  select(sample_name, all_of(motif_cols), all_of(phenotype_cols)) %>%
   drop_na(all_of(motif_cols))
-
 ```
 
 
-Define helper functions
 ```{r}
-
-# Helper functions used by fit_one_phenotype_de_all_plus_cvsd:
-#
-#   safe_cor(x, y)
-#     Pearson correlation that returns NA instead of crashing when there are
-#     too few points or zero-variance inputs.
-#
-#   rmse(x, y)
-#     Root mean squared error between two numeric vectors.
-#
-#   phenotype_to_de(f_obs, f_low, f_high, eps)
-#     Converts a raw fluorescence value to ΔE using the two-state model.
-#     First computes frac_on = (f_obs - f_low) / (f_high - f_low),
-#     clips frac_on to [eps, 1-eps], then returns
-#     ΔE = log((1-frac_on)/frac_on). Returns NA for missing or degenerate inputs.
-#
-#   de_to_phenotype(dE, f_low, f_high)
-#     Inverse of phenotype_to_de. Converts a predicted ΔE back to predicted
-#     fluorescence: frac_on = 1/(1+exp(ΔE)), f_pred = f_low*(1-frac_on) + f_high*frac_on.
-
-# Correlation that won't crash if there are too few points or zero variance
 safe_cor <- function(x, y) {
   if (length(x) < 3) return(NA_real_)
   if (sd(x, na.rm = TRUE) == 0 || sd(y, na.rm = TRUE) == 0) return(NA_real_)
   cor(x, y, use = "complete.obs")
 }
 
-# Root mean squared error
 rmse <- function(x, y) sqrt(mean((x - y)^2, na.rm = TRUE))
-
-# Convert f_obs -> ΔE using two-state mapping:
-#   frac_on = (f_obs - f_low) / (f_high - f_low)
-#   ΔE      = log((1-frac_on)/frac_on)
-# eps clips frac_on away from 0 and 1 so ΔE doesn't become +/- infinity.
-phenotype_to_de <- function(f_obs, f_low, f_high, eps = 1e-6) {
-  denom <- f_high - f_low
-  ifelse(
-    is.na(f_obs) | is.na(f_low) | is.na(f_high) | denom == 0,
-    NA_real_,
-    {
-      frac_on <- (f_obs - f_low) / denom
-      frac_on <- pmin(pmax(frac_on, eps), 1 - eps)
-      log((1 - frac_on) / frac_on)
-    }
-  )
-}
-
-# Convert predicted ΔE back to predicted fluorescence:
-#   frac_on = 1/(1+exp(ΔE))
-#   f_pred  = f_low*(1-frac_on) + f_high*frac_on
-de_to_phenotype <- function(dE, f_low, f_high) {
-  frac_on <- 1 / (1 + exp(dE))
-  f_low * (1 - frac_on) + f_high * frac_on
-}
 ```
 
-Define a function to fit SCR motif library data to a single phenotype
 ```{r}
+# fit_two_state_model fits a two-state model in MFI space for one phenotype.
+# Parameters (ΔEi, ΔEs_S1..S9) are estimated by minimizing MFI residuals on
+# individual replicates via BFGS. r and R² are evaluated on averaged replicates.
+# Coefficients are returned in the same format used for Ki/Ks plots and tables.
 
-# fit_one_phenotype_de_all_plus_cvsd fits a linear model in ΔE space for one
-# phenotype and returns three output tables: coefficients, per-sample
-# predictions, and fit quality metrics.
-#
-# Steps:
-#   1. Look up bounds (f_low, f_high) for this phenotype from
-#      phenotype_extremes_tbl. These define the dynamic range of the two-state
-#      model and are required for the ΔE transformation.
-#
-#   2. Build the fitting dataset from base_fit_df. Drops samples missing the
-#      phenotype value and transforms each observed phenotype to ΔE, storing
-#      intermediate f values for the output table.
-#
-#   3. Fit a linear model on the full dataset: ΔE ~ S1 + S2 + ... + S9.
-#      All expected terms are kept in the output even if dropped by lm (as NA).
-#
-#   4. Run k-fold cross-validation on training splits to estimate how stable
-#      each coefficient is across data subsets. Reports CV-SD (standard
-#      deviation of each coefficient across folds, not divided by sqrt(k)).
-#
-#   5. Predict ΔE for all samples using the full-data coefficients, then
-#      back-transform to phenotype space using de_to_phenotype(). Assembles
-#      the per-sample prediction table.
-#
-#   6. Compute fit quality metrics in both ΔE and phenotype space using
-#      safe_cor() and rmse(). Also computes residual sigma in ΔE space.
+fit_two_state_model <- function(phenotype_mean_col, n_folds = 10, seed = 123) {
 
-fit_one_phenotype_de_all_plus_cvsd <- function(phenotype_mean_col,
-                                               n_folds = 10,
-                                               eps     = 1e-6,
-                                               seed    = 123) {
+  eps               <- 1e-6
+  phenotype_raw_col <- str_remove(phenotype_mean_col, "_mean$")
+  term_names        <- c("(Intercept)", motif_cols)
 
-  expected_terms <- c("(Intercept)", motif_cols)
-
-  # ---- Step 1: Look up bounds for this phenotype ----
-  ext        <- phenotype_extremes_tbl %>% filter(.data$phenotype == phenotype_mean_col) %>% slice(1)
+  # ---- Step 1: Bounds ----
+  ext    <- phenotype_extremes_tbl %>% filter(.data$phenotype == phenotype_mean_col) %>% slice(1)
   f_low  <- ext$f_low
   f_high <- ext$f_high
 
-  # ---- Step 2: Build dataset and transform observed phenotype to ΔE ----
-  # Uses phenotype_to_de() logic inline to also retain frac_on and frac_on_clipped
-  d <- base_fit_df %>%
-    select(sample_name, all_of(motif_cols), all_of(phenotype_mean_col)) %>%
-    rename(f_obs = all_of(phenotype_mean_col)) %>%
+  # ---- Step 2: Build datasets ----
+  # d_ind: individual replicates — fitting and CV
+  # d_avg: averaged replicates  — predictions and r
+  d_ind <- fit_df %>%
+    select(sample_name, all_of(motif_cols), all_of(phenotype_raw_col)) %>%
+    rename(f_obs = all_of(phenotype_raw_col)) %>%
     drop_na(f_obs) %>%
     mutate(
-      frac_on         = (f_obs - f_low) / (f_high - f_low),
-      frac_on_clipped = pmin(pmax(frac_on, eps), 1 - eps),
-      dE_obs          = log((1 - frac_on_clipped) / frac_on_clipped)
-    ) %>%
-    drop_na(dE_obs)
+      frac_on = pmin(pmax((f_obs - f_low) / (f_high - f_low), eps), 1 - eps),
+      dE_obs  = log((1 - frac_on) / frac_on)
+    )
 
-  cat(sprintf(
-    "\nΔE-LM for %s | f_low=%.3f, f_high=%.3f | N=%d, folds=%d\n",
-    phenotype_mean_col, f_low, f_high, nrow(d), n_folds
-  ))
+  d_avg <- synth_df_aggregated %>%
+    select(sample_name, all_of(motif_cols), all_of(phenotype_mean_col)) %>%
+    rename(f_obs = all_of(phenotype_mean_col)) %>%
+    drop_na(f_obs)
 
-  fml <- as.formula(paste("dE_obs ~", paste(motif_cols, collapse = " + ")))
+  cat(sprintf("\n%s | f_low=%.1f, f_high=%.1f | N_ind=%d, N_avg=%d\n",
+              phenotype_mean_col, f_low, f_high, nrow(d_ind), nrow(d_avg)))
 
-  # ---- Step 3: Fit linear model on full dataset ----
-  fit_all <- try(lm(fml, data = d), silent = TRUE)
-  if (inherits(fit_all, "try-error")) {
-    return(list(
-      phenotype   = phenotype_mean_col,
-      coef_tbl    = tibble(),
-      pred_tbl    = tibble(),
-      quality_tbl = tibble(
-        phenotype  = phenotype_mean_col,
-        status     = "model fit failed",
-        n_samples  = nrow(d),
-        f_low  = f_low,
-        f_high = f_high
-      )
-    ))
+  mm_ind <- as.matrix(d_ind[, motif_cols])
+
+  # Two-state MFI prediction: params = c(dEi, dEs_S1..S9)
+  predict_mfi <- function(params, mm) {
+    f_on <- 1 / (1 + exp(params[1] + as.vector(mm %*% params[-1])))
+    f_low * (1 - f_on) + f_high * f_on
   }
 
-  coefs_all <- broom::tidy(fit_all) %>%
-    select(term, estimate) %>%
-    right_join(tibble(term = expected_terms), by = "term") %>%
-    arrange(match(term, expected_terms))
+  mfi_loss <- function(params, f_obs, mm)
+    sum((f_obs - predict_mfi(params, mm))^2, na.rm = TRUE)
 
-  # ---- Step 4: k-fold CV to estimate coefficient stability (CV-SD) and held-out R² ----
+  # Initialize ΔEi from no-motif mean; motif ΔEs at 0
+  no_motif    <- rowSums(mm_ind) == 0
+  init_params <- c(
+    if (any(no_motif)) mean(d_ind$dE_obs[no_motif], na.rm = TRUE) else 0,
+    rep(0, length(motif_cols))
+  )
+
+  # ---- Step 3: Fit ----
+  fit_all <- try(
+    optim(init_params, mfi_loss, f_obs = d_ind$f_obs, mm = mm_ind,
+          method = "BFGS", control = list(maxit = 5000)),
+    silent = TRUE
+  )
+
+  if (inherits(fit_all, "try-error") || fit_all$convergence != 0)
+    warning(sprintf("optim did not converge for %s (code %d)", phenotype_mean_col,
+                    if (inherits(fit_all, "try-error")) -1L else fit_all$convergence))
+
+  if (inherits(fit_all, "try-error"))
+    return(list(phenotype = phenotype_mean_col, coef_tbl = tibble(), pred_tbl = tibble(),
+                quality_tbl = tibble(phenotype = phenotype_mean_col, status = "model fit failed",
+                                     n_samples = nrow(d_avg), n_ind = nrow(d_ind))))
+
+  coefs_all <- tibble(term = term_names, estimate = fit_all$par)
+
+  # ---- Step 4: k-fold CV ----
   set.seed(seed)
-  folds <- vfold_cv(d, v = n_folds)
+  folds <- vfold_cv(d_ind, v = n_folds)
 
   fold_results <- map(folds$splits, function(split) {
     train <- analysis(split)
     test  <- assessment(split)
-    fit   <- try(lm(fml, data = train), silent = TRUE)
-    if (inherits(fit, "try-error")) {
-      return(list(
-        coefs = tibble(term = expected_terms, estimate = NA_real_),
-        oof   = tibble(observed_dE = test$dE_obs, predicted_dE = NA_real_)
-      ))
-    }
+    mm_tr <- as.matrix(train[, motif_cols])
+    mm_te <- as.matrix(test[, motif_cols])
+
+    fit_fold <- try(
+      optim(fit_all$par, mfi_loss, f_obs = train$f_obs, mm = mm_tr,
+            method = "BFGS", control = list(maxit = 2000)),
+      silent = TRUE
+    )
+
+    if (inherits(fit_fold, "try-error"))
+      return(list(coefs = tibble(term = term_names, estimate = NA_real_),
+                  oof   = tibble(f_obs = test$f_obs, f_pred = NA_real_)))
+
     list(
-      coefs = broom::tidy(fit) %>%
-        select(term, estimate) %>%
-        right_join(tibble(term = expected_terms), by = "term"),
-      oof = tibble(
-        observed_dE        = test$dE_obs,
-        predicted_dE       = predict(fit, newdata = test),
-        f_obs = test$f_obs
-      )
+      coefs = tibble(term = term_names, estimate = fit_fold$par),
+      oof   = tibble(f_obs = test$f_obs, f_pred = predict_mfi(fit_fold$par, mm_te))
     )
   })
 
-  # Coefficient stability: SD of each coefficient across folds
-  fold_coefs <- map_dfr(fold_results, "coefs", .id = "fold")
-  cv_sd <- fold_coefs %>%
+  cv_sd <- map_dfr(fold_results, "coefs", .id = "fold") %>%
     group_by(term) %>%
-    summarise(
-      std.dev         = sd(estimate, na.rm = TRUE),
-      n_folds_success = sum(!is.na(estimate)),
-      .groups         = "drop"
-    )
+    summarise(std.dev = sd(estimate, na.rm = TRUE), .groups = "drop")
 
-  # Cross-validated R²: pooled held-out predictions across all folds
-  oof_preds           <- map_dfr(fold_results, "oof")
-  oof_f_pred  <- de_to_phenotype(oof_preds$predicted_dE, f_low, f_high)
-  cv_r2_dE            <- safe_cor(oof_preds$observed_dE,        oof_preds$predicted_dE)^2
-  cv_r2_phenotype     <- safe_cor(oof_preds$f_obs, oof_f_pred)^2
+  oof    <- map_dfr(fold_results, "oof")
+  cv_r2  <- safe_cor(oof$f_obs, oof$f_pred)^2
 
   coef_tbl <- coefs_all %>%
     left_join(cv_sd, by = "term") %>%
-    mutate(phenotype = phenotype_mean_col, f_low = f_low, f_high = f_high, eps_clip = eps)
+    mutate(phenotype = phenotype_mean_col, f_low = f_low, f_high = f_high)
 
-  # ---- Step 5: Predict ΔE then back-transform to phenotype space using de_to_phenotype() ----
-  coef_vec       <- setNames(coefs_all$estimate, coefs_all$term)
-  dE_pred        <- as.vector(as.matrix(cbind(1, d[, motif_cols])) %*% coef_vec)
-  f_pred <- de_to_phenotype(dE_pred, f_low, f_high)
-  motif_count    <- rowSums(d[, motif_cols])
+  # ---- Step 5: Predict on averaged data ----
+  mm_avg      <- as.matrix(d_avg[, motif_cols])
+  f_pred      <- predict_mfi(fit_all$par, mm_avg)
+  motif_count <- rowSums(mm_avg)
 
   pred_tbl <- tibble(
-    phenotype           = phenotype_mean_col,
-    sample_name         = d$sample_name,
-    f_obs  = d$f_obs,
-    f_pred = f_pred,
-    frac_on             = d$frac_on,
-    frac_on_clipped     = d$frac_on_clipped,
-    observed_dE         = d$dE_obs,
-    predicted_dE        = dE_pred,
-    motif_count         = motif_count
+    phenotype   = phenotype_mean_col,
+    sample_name = d_avg$sample_name,
+    f_obs       = d_avg$f_obs,
+    f_pred      = f_pred,
+    motif_count = motif_count
   ) %>%
     mutate(
       motif_group = case_when(
@@ -554,82 +478,56 @@ fit_one_phenotype_de_all_plus_cvsd <- function(phenotype_mean_col,
       motif_group = factor(motif_group, levels = c("0 motifs", "1 motif", "2+ motifs"))
     )
 
-  # ---- Step 6: Quality metrics in ΔE and phenotype space using safe_cor() and rmse() ----
-  r_dE        <- safe_cor(pred_tbl$observed_dE,        pred_tbl$predicted_dE)
-  r_phenotype <- safe_cor(pred_tbl$f_obs, pred_tbl$f_pred)
-  df_approx   <- nrow(d) - (length(motif_cols) + 1)
-  sigma       <- sqrt(sum((pred_tbl$observed_dE - pred_tbl$predicted_dE)^2, na.rm = TRUE) / df_approx)
+  # ---- Step 6: Quality metrics on averaged data ----
+  r <- safe_cor(pred_tbl$f_obs, pred_tbl$f_pred)
 
   quality_tbl <- tibble(
-    phenotype       = phenotype_mean_col,
-    r2_dE           = r_dE^2,
-    cv_r2_dE        = cv_r2_dE,
-    r_phenotype     = r_phenotype,
-    r2_phenotype    = r_phenotype^2,
-    cv_r2_phenotype = cv_r2_phenotype,
-    rmse_dE         = rmse(pred_tbl$observed_dE,        pred_tbl$predicted_dE),
-    rmse_phenotype  = rmse(pred_tbl$f_obs, pred_tbl$f_pred),
-    sigma          = sigma,
-    n_samples      = nrow(d),
-    n_predictors   = length(motif_cols),
-    n_folds        = n_folds,
-    f_low      = f_low,
-    f_high     = f_high,
-    eps_clip       = eps,
-    status         = "ok"
+    phenotype = phenotype_mean_col,
+    r         = r,
+    r2        = r^2,
+    cv_r2     = cv_r2,
+    rmse      = rmse(pred_tbl$f_obs, pred_tbl$f_pred),
+    n_samples = nrow(d_avg),
+    n_ind     = nrow(d_ind),
+    f_low     = f_low,
+    f_high    = f_high,
+    status    = if (fit_all$convergence == 0) "ok" else paste0("convergence code ", fit_all$convergence)
   )
 
-  list(
-    phenotype   = phenotype_mean_col,
-    coef_tbl    = coef_tbl,
-    pred_tbl    = pred_tbl,
-    quality_tbl = quality_tbl
-  )
+  list(phenotype = phenotype_mean_col, coef_tbl = coef_tbl, pred_tbl = pred_tbl, quality_tbl = quality_tbl)
 }
 ```
 
 Run model fitting across all phenotypes and inspect quality metrics
 ```{r}
 
-# Fit the model for every phenotype in phenotype_mean_cols
-fit_list <- map(phenotype_mean_cols, fit_one_phenotype_de_all_plus_cvsd)
+# Fit the model for every phenotype
+fit_list <- map(phenotype_mean_cols, fit_two_state_model)
 
-# Stack the three output tables across all phenotypes
+# Stack output tables across all phenotypes
 results_coef    <- map_dfr(fit_list, "coef_tbl")
 results_pred    <- map_dfr(fit_list, "pred_tbl")
 results_quality <- map_dfr(fit_list, "quality_tbl")
 
-# Print quality metrics
-# Key columns to interpret:
-#   r2_dE          - in-sample R² in ΔE space (how well the model fits the training data)
-#   cv_r2_dE       - cross-validated R² in ΔE space (held-out performance; more honest estimate of generalizability)
-#   r_phenotype    - Pearson r in original phenotype space (sign matters: positive = correct direction)
-#   r2_phenotype    - in-sample R² in original phenotype space (after back-transformation)
-#   cv_r2_phenotype - cross-validated R² in phenotype space (held-out predictions back-transformed via dE_to_phenotype())
-#   rmse_dE        - prediction error in ΔE units
-#   rmse_phenotype - prediction error in original phenotype units (interpretable scale)
-#   sigma          - residual SD in ΔE space (penalizes for number of predictors)
-#   n_samples      - number of samples used for this phenotype
-#   status         - "ok" if fit succeeded; otherwise describes the failure
 results_quality %>%
-  select(phenotype, r2_dE, cv_r2_dE, r_phenotype, r2_phenotype, cv_r2_phenotype, rmse_dE, rmse_phenotype, sigma, n_samples, status) %>%
-  arrange(desc(r2_dE))
+  select(phenotype, r, r2, cv_r2, rmse, n_samples, n_ind, status) %>%
+  arrange(desc(r2))
 ```
 
 
 Plot in-sample vs cross-validated R² per phenotype
 ```{r}
 results_quality %>%
-  select(phenotype, r2_phenotype, cv_r2_phenotype) %>%
+  select(phenotype, r2, cv_r2) %>%
   pivot_longer(
-    cols      = c(r2_phenotype, cv_r2_phenotype),
+    cols      = c(r2, cv_r2),
     names_to  = "metric",
     values_to = "r2"
   ) %>%
   mutate(
     metric   = recode(metric,
-                      r2_phenotype    = "In-sample R²",
-                      cv_r2_phenotype = "Cross-validated R²"),
+                      r2    = "In-sample R²",
+                      cv_r2 = "Cross-validated R²"),
     metric   = factor(metric, levels = c("In-sample R²", "Cross-validated R²")),
     phenotype = fct_reorder(phenotype, r2, .fun = max, .desc = TRUE)
   ) %>%
@@ -665,9 +563,9 @@ log_f_predictions <- results_pred %>%
   mutate(
     phenotype_label = str_remove(phenotype, "_mean$"),
     motif_group = factor(motif_group, levels = c("0 motifs", "1 motif", "2+ motifs")),
-    # Log-transform phenotype (natural log)
-    f_obs_log = log(f_obs),
-    f_pred_log = log(f_pred)
+    # Log-transform phenotype (log 10)
+    f_obs_log = log10(f_obs),
+    f_pred_log = log10(f_pred)
   )
 
 # Compute r and R² on raw values, display on log-transformed plot
@@ -742,8 +640,8 @@ p_phenotype_log_obs_pred <- ggplot(
   scale_color_manual(values = motif_colors, name = "Motif Count") +
   scale_alpha_manual(values = motif_alphas, guide = "none") +
   labs(
-    x = "log(f_obs)",
-    y = "log(f_pred)",
+    x = "log10(f_obs)",
+    y = "log10(f_pred)",
     title = "Model: Observed vs Predicted (log-transformed)",
   ) +
   theme_classic(base_size = 11) +
@@ -778,37 +676,9 @@ The equilibrium constant $K = e^{-\Delta E}$ uses the total $\Delta E$. Each mot
 - Ks < 1: Motif shifts equilibrium toward negative state (corresponds to ΔEs > 0)
 
 ```{r}
-# ==============================================================================
-# Plot per-motif effects as log10(Ks) with CV-derived uncertainty (phenotype ΔEs model)
-# ==============================================================================
-# Context:
-#   For each surface marker, we fit a linear model in ΔE space:
-#     ΔE_total = ΔE0 + Σ ΔEs_Si * n_Si
-#
-#   Each fitted motif coefficient is a per-motif (single-motif) ΔEs value.
-#   We convert each ΔEs coefficient into its per-motif equilibrium-constant effect:
-#     Ks = exp(-ΔEs)
-#
-#   Taking log10 gives:
-#     log10(Ks) = log10(exp(-ΔEs)) = -ΔEs * log10(e)
-#
-# Key properties:
-#   - log10(Ks) is a linear transform of ΔEs (scaling + sign flip)
-#   - therefore uncertainty propagation is symmetric:
-#       SD[log10(Ks)] = log10(e) * SD[ΔEs]
-#
-# What the error bars represent:
-#   - std.dev in results_coef is SD of coefficient estimates across CV folds
-#     (coefficient stability across different training subsets).
-#   - This is a CV fold-to-fold variability measure.
-# ==============================================================================
-
-
-# results_coef contains one row per (phenotype, term) with columns:
-#   term      - coefficient name: "(Intercept)" or "S1"..."S9"
-#   estimate  - fitted ΔEs coefficient from the all-data linear model
-#   std.dev   - SD of that ΔEs coefficient across the k CV fold models
-#               (measures stability: large SD = coefficient varies a lot fold-to-fold)
+# Each fitted coefficient is a per-motif ΔEs value; Ks = exp(-ΔEs).
+# Error bars show ± 1 SD of each coefficient across CV folds (stability).
+# results_coef columns used: term, estimate (ΔEs), std.dev (CV-fold SD), phenotype.
 
 # Fix x-axis order: intercept first, then motifs S1-S9
 term_order <- c("(Intercept)", paste0("S", 1:9))
@@ -854,7 +724,7 @@ p_log10Ks <- ggplot(log10Ks_plot_df, aes(x = term, y = log10Ks_estimate)) +
     aes(ymin = ymin, ymax = ymax),
     width = 0.20,
     linewidth = 0.35,
-    na.rm = TRUE        # silently skip terms with NA std.dev (e.g. dropped by lm)
+    na.rm = TRUE
   ) +
   geom_hline(yintercept = 0, linewidth = 0.4, linetype = "dashed", color = "red") +
   facet_wrap(~ phenotype_label, scales = "free_y") +
@@ -886,3 +756,193 @@ ggsave(
 )
 
 ```
+
+# ===================================
+# Export fitted values 
+
+```{r}
+coef_export_tbl <- results_coef %>%
+  mutate(
+    K_value    = exp(-estimate),
+    term_label = ifelse(term == "(Intercept)", "Ki", paste0("Ks_", term)),
+    dE_label   = ifelse(term == "(Intercept)", "dEi", paste0("dEs_", term)),
+    phenotype  = str_remove(phenotype, "_mean$")
+  ) %>%
+  select(phenotype, term_label, dE_label, K_value, estimate) %>%
+  pivot_wider(
+    id_cols     = phenotype,
+    names_from  = c(term_label, dE_label),
+    values_from = c(K_value, estimate),
+    names_glue  = "{term_label}_or_{dE_label}_{.value}"
+  )
+
+# Build tidy wide table: one row per phenotype, columns for K and ΔE values side by side
+term_order_export <- c("(Intercept)", paste0("S", 1:9))
+coef_export_tbl <- results_coef %>%
+  mutate(phenotype = str_remove(phenotype, "_mean$")) %>%
+  arrange(phenotype, match(term, term_order_export)) %>%
+  mutate(
+    K_value    = exp(-estimate),
+    term_label = ifelse(term == "(Intercept)", "Ki",    paste0("Ks_", term)),
+    dE_label   = ifelse(term == "(Intercept)", "dEi",   paste0("dEs_", term))
+  ) %>%
+  select(phenotype, term_label, dE_label, K_value, estimate) %>%
+  pivot_longer(
+    cols      = c(K_value, estimate),
+    names_to  = "value_type",
+    values_to = "value"
+  ) %>%
+  mutate(col_name = ifelse(value_type == "K_value", term_label, dE_label)) %>%
+  select(phenotype, col_name, value) %>%
+  pivot_wider(names_from = col_name, values_from = value) %>%
+  select(phenotype,
+         Ki,   dEi,
+         Ks_S1, dEs_S1, Ks_S2, dEs_S2, Ks_S3, dEs_S3,
+         Ks_S4, dEs_S4, Ks_S5, dEs_S5, Ks_S6, dEs_S6,
+         Ks_S7, dEs_S7, Ks_S8, dEs_S8, Ks_S9, dEs_S9)
+
+knitr::kable(coef_export_tbl, digits = 4,
+             caption = "Fitted K and ΔE values per phenotype (Ki/dEi = intrinsic; Ks/dEs = per-motif)")
+
+write.csv(coef_export_tbl, file = file.path(plot_folder, "Ki_Ks_dEi_dEs_table.csv"), row.names = FALSE)
+```
+
+
+# Predictions for all 0-4 motif SCRs 
+
+
+Generate predictions and compute inflammatory score.
+```{r}
+# All (n_S1,...,n_S9) with each n_k >= 0 and total <= 4 (715 combinations)
+all_combos <- expand.grid(setNames(rep(list(0:4), 9), paste0("S", 1:9))) %>%
+  filter(rowSums(.) <= 4) %>%
+  mutate(across(everything(), as.integer)) %>%
+  as_tibble()
+
+# Apply fitted model coefficients to predict each phenotype
+predict_phenotype <- function(combos, phenotype_col, coef_data) {
+  p      <- coef_data %>% filter(phenotype == phenotype_col)
+  dEi    <- p$estimate[p$term == "(Intercept)"]
+  dEs    <- p %>% filter(term != "(Intercept)") %>%
+    arrange(match(term, paste0("S", 1:9))) %>%
+    pull(estimate)
+  f_low  <- p$f_low[1]
+  f_high <- p$f_high[1]
+  mm     <- as.matrix(combos[, paste0("S", 1:9)])
+  f_on   <- 1 / (1 + exp(dEi + as.vector(mm %*% dEs)))
+  f_low * (1 - f_on) + f_high * f_on
+}
+
+combo_predictions <- all_combos
+for (pheno in phenotype_mean_cols) {
+  pred_col <- paste0(str_remove(pheno, "_mean$"), "_pred")
+  combo_predictions[[pred_col]] <- predict_phenotype(all_combos, pheno, results_coef)
+}
+
+# Normalize CD40 and CD80 predictions to 0-1 and average into an inflammatory score
+combo_predictions <- combo_predictions %>%
+  mutate(
+    CD40_norm          = (CD40_MFI_pred - min(CD40_MFI_pred)) / (max(CD40_MFI_pred) - min(CD40_MFI_pred)),
+    CD80_norm          = (CD80_MFI_pred - min(CD80_MFI_pred)) / (max(CD80_MFI_pred) - min(CD80_MFI_pred)),
+    inflammatory_score = (CD40_norm + CD80_norm) / 2,
+    total_motifs       = rowSums(across(all_of(paste0("S", 1:9)))),
+    total_motifs_label = factor(
+      case_when(
+        total_motifs == 0 ~ "0 motifs",
+        total_motifs == 1 ~ "1 motif",
+        total_motifs == 2 ~ "2 motifs",
+        total_motifs == 3 ~ "3 motifs",
+        total_motifs == 4 ~ "4 motifs"
+      ),
+      levels = c("0 motifs", "1 motif", "2 motifs", "3 motifs", "4 motifs")
+    ),
+    combo_label = paste0(
+      ifelse(S1 > 0, paste0("S1×", S1, " "), ""),
+      ifelse(S2 > 0, paste0("S2×", S2, " "), ""),
+      ifelse(S3 > 0, paste0("S3×", S3, " "), ""),
+      ifelse(S4 > 0, paste0("S4×", S4, " "), ""),
+      ifelse(S5 > 0, paste0("S5×", S5, " "), ""),
+      ifelse(S6 > 0, paste0("S6×", S6, " "), ""),
+      ifelse(S7 > 0, paste0("S7×", S7, " "), ""),
+      ifelse(S8 > 0, paste0("S8×", S8, " "), ""),
+      ifelse(S9 > 0, paste0("S9×", S9, " "), "")
+    ) %>% str_trim() %>% ifelse(. == "", "No motif", .)
+  )
+
+# Flag combinations that were experimentally tested in the fitted data
+tested_combos <- synth_df %>%
+  mutate(across(all_of(paste0("S", 1:9)), as.integer)) %>%
+  select(all_of(paste0("S", 1:9))) %>%
+  distinct() %>%
+  mutate(experimentally_tested = TRUE)
+
+combo_predictions <- combo_predictions %>%
+  left_join(tested_combos, by = paste0("S", 1:9)) %>%
+  mutate(experimentally_tested = replace_na(experimentally_tested, FALSE))
+
+# Pareto front: combinations that maximize both phagocytosis and inflammatory score
+pareto_front <- combo_predictions %>%
+  arrange(desc(phagocytosis_index_pred)) %>%
+  mutate(
+    best_inflam = cummax(inflammatory_score),
+    is_pareto   = inflammatory_score >= best_inflam - 1e-12
+  ) %>%
+  filter(is_pareto) %>%
+  arrange(phagocytosis_index_pred)
+
+# Three special designs to highlight as colored squares
+special_designs <- tibble(
+  S1 = c(0L, 2L, 0L),
+  S2 = c(0L, 0L, 0L),
+  S3 = c(0L, 0L, 2L),
+  S4 = c(0L, 0L, 0L),
+  S5 = c(0L, 0L, 0L),
+  S6 = c(0L, 0L, 0L),
+  S7 = c(0L, 0L, 0L),
+  S8 = c(0L, 0L, 0L),
+  S9 = c(0L, 0L, 0L),
+  fill_color = c("black", "#dea152", "#8e64a2")
+) %>%
+  left_join(combo_predictions, by = paste0("S", 1:9))
+```
+
+
+
+
+Plot to predict phagocytosis by inflammatory score for all motif combinations (0-4 motifs)
+```{r}
+p_design_space <- ggplot(combo_predictions,
+                         aes(x = phagocytosis_index_pred, y = inflammatory_score)) +
+  geom_point(data = filter(combo_predictions, !experimentally_tested),
+             color = "grey80", size = 1.5, alpha = 0.4) +
+  geom_point(data = filter(combo_predictions, experimentally_tested),
+             color = "steelblue", size = 2, alpha = 0.9) +
+  geom_line(data  = pareto_front,
+            color = "black", linewidth = 0.8, linetype = "dashed") +
+  geom_point(data = pareto_front, size = 2.5) +
+  geom_text_repel(data = pareto_front, aes(label = combo_label),
+                  size = 3, color = "black", max.overlaps = 20, box.padding = 0.5) +
+  geom_point(data  = special_designs,
+             aes(fill = fill_color),
+             shape = 22, size = 5, stroke = 0) +
+  scale_fill_identity() +
+  scale_y_continuous(limits = c(0, 1), expand = c(0.01, 0.01)) +
+  theme_classic(base_size = 11) +
+  theme(panel.border    = element_rect(color = "black", fill = NA, linewidth = 0.5),
+        legend.position = "none") +
+  labs(x = "Predicted Phagocytosis Index",
+       y = "Inflammatory Score\n(normalized CD40 + CD80) / 2")
+
+p_design_space
+
+ggsave(
+  filename = file.path(plot_folder, "zero_to_four_motif_predictions.svg"),
+  plot     = p_design_space,
+  width    = 7,
+  height   = 5,
+  device   = "svg"
+)
+```
+
+
+
